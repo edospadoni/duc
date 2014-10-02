@@ -25,7 +25,77 @@ struct param {
 	struct param *next;
 };
 
+/* Right out of K&R */
+struct tnode {
+    char *key;
+    char *file;
+    struct tnode *left;
+    struct tnode *right;
+};
+
 struct param *param_list = NULL;
+
+/* Helpers to buid tree of PATH names and the full path to said PATH
+   so that we don't expose internal filesystem details to external
+   users, such as where the DB(s) are actually stored.  All pulled
+   from K&R "The C Programming Language" because it's still the best.
+   */
+
+struct tnode *talloc() {
+    return((struct tnode *) malloc(sizeof(struct tnode)));
+}
+
+struct tnode *tree( struct tnode *r, char *k, char *w) {
+    int cond;
+
+    if (r == NULL) {  /* Empty tree... */
+	r = talloc();
+	r->key = k;
+	r->file = w;
+	r->left = r->right = NULL;
+    }
+
+    else {
+	cond = strcmp(k, r->key);
+	if (cond == 0) {
+	    fprintf(stderr,"Error!  We found a duplicate key: %s\n",k);
+	    exit(1);
+	} 
+	else if (cond < 0) {
+	    r->left = tree(r->left, k, w);
+	}
+	else {
+	    r->right = tree(r->right, k, w);
+	}	
+    }
+    return(r);
+}
+
+void treeprint(struct tnode *p) {
+    if (p != NULL) {
+	treeprint(p->left);
+	printf(" %14s -> %s\n",p->key, p->file);
+	treeprint(p->right);
+    }
+}
+
+struct tnode * treefindfile(struct tnode *p, char *k) {
+    int cond;
+    if (p == NULL) {
+	return(NULL);
+    }
+
+    if ((cond = strcmp(k, p->key)) == 0) {
+	return(p);
+    } 
+    else if (cond < 0) {
+	return(treefindfile(p->left,k));
+    }
+    else {
+	return(treefindfile(p->right,k));
+    }
+}
+
 
 /* silly little helper */
 static void print_html_header(const char *title) {
@@ -192,15 +262,16 @@ void do_image(duc *duc, duc_graph *graph, duc_dir *dir)
 
 
 
+
 static int cgi_main(int argc, char **argv)
 {
 	int r;
 	
 	r = cgi_parse();
 	if(r != 0) {
-		fprintf(stderr, 
-			"The 'cgi' subcommand is used for integrating Duc into a web server.\n"
-			"Please refer to the documentation for instructions how to install and configure.\n"
+	    fprintf(stderr, 
+		    "The 'cgi' subcommand is used for integrating Duc into a web server.\n"
+		    "Please refer to the documentation for instructions how to install and configure.\n"
 		);
 		return(-1);
 	}
@@ -217,18 +288,18 @@ static int cgi_main(int argc, char **argv)
 	int c;
 	while( ( c = getopt_long(argc, argv, "d:D:", longopts, NULL)) != EOF) {
 
-		switch(c) {
-			case 'd':
-				path_db = optarg;
-				break;
-			case 'D':
-				db_dir = optarg;
-				break;
-			default:
-				return -2;
-		}
+	    switch(c) {
+	    case 'd':
+		path_db = realpath(optarg, NULL);
+		break;
+	    case 'D':
+		db_dir = realpath(optarg, NULL);
+		break;
+	    default:
+		return -2;
+	    }
 	}
-
+	
 
 	char *cmd = cgi_get("cmd");
 	char *path = cgi_get("path");
@@ -236,7 +307,6 @@ static int cgi_main(int argc, char **argv)
 	
 	duc *duc = duc_new();
 	if(duc == NULL) {
-	    
 	    print_html_header("Error creating duc context\n");
 	    printf("<BODY>Sorry, we had a problem with the CGI script.\n</BODY></HTML>\n");
 	    return -1;
