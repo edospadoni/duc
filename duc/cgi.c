@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <assert.h>
 #include <unistd.h>
@@ -116,6 +118,10 @@ static void print_html_header(const char *title) {
 	);
 }	
 
+/* 
+   Parses the CGI input parameters, does NO sanity checking.  Needs
+   work to make safer.  
+*/
 static int cgi_parse(void)
 {
 	char *qs = getenv("QUERY_STRING");
@@ -138,9 +144,14 @@ static int cgi_parse(void)
 		struct param *param = malloc(sizeof(struct param));
 		assert(param);
 
+		/* Do we filter out bogus commands here?  I think so... FIXME */
+
 		param->key = malloc(keylen+1);
 		assert(param->key);
 		strncpy(param->key, key, keylen);
+
+		/* Now to filter parameters, to make sure we don't have an XSS
+		   vulns either.  FIXME */
 
 		param->val = malloc(vallen+1);
 		assert(param->val);
@@ -193,8 +204,12 @@ static void do_index(duc *duc, duc_graph *graph, duc_dir *dir)
 	}
 
 	if(x || y) {
-		//char newpath[PATH_MAX];
-		//duc_graph_xy_to_path(graph, dir, x, y, newpath, sizeof newpath);
+		duc_dir *dir2 = duc_graph_find_spot(graph, dir, x, y);
+		if(dir2) {
+			duc_dir_close(dir);
+			dir = dir2;
+			path = duc_dir_get_path(dir);
+		}
 	}
 
 	struct duc_index_report *report;
@@ -223,17 +238,18 @@ static void do_index(duc *duc, duc_graph *graph, duc_dir *dir)
 		char url[PATH_MAX];
 		snprintf(url, sizeof url, "%s?cmd=index&path=%s", script, report->path);
 
-		char siz[32];
-		duc_humanize(report->size_total, siz, sizeof siz);
+		char *siz = duc_human_size(report->size_total);
 
 		printf("<tr>");
 		printf("<td><a href='%s'>%s</a></td>", url, report->path);
 		printf("<td>%s</td>", siz);
-		printf("<td>%zu</td>", report->file_count);
-		printf("<td>%zu</td>", report->dir_count);
+		printf("<td>%lu</td>", (unsigned long)report->file_count);
+		printf("<td>%lu</td>", (unsigned long)report->dir_count);
 		printf("<td>%s</td>", ts_date);
 		printf("<td>%s</td>", ts_time);
 		printf("</tr>\n");
+
+		free(siz);
 
 		duc_index_report_free(report);
 		i++;
@@ -244,12 +260,27 @@ static void do_index(duc *duc, duc_graph *graph, duc_dir *dir)
 		printf("<a href='%s?cmd=index&path=%s&'>", script, path);
 		printf("<img src='%s?cmd=image&path=%s' ismap='ismap'>\n", script, path);
 		printf("</a><br>");
-		printf("<b>%s</b><br>", path);
 	}
 	fflush(stdout);
 }
 
+/* return a string of the time the file was last modified.  I hate C
+   programming... */
 
+char *last_updated(char * path) {
+
+  struct stat stbuf;
+  int r = stat(path, &stbuf);
+
+  if (r == -1) {
+	return NULL;
+  }
+  else {
+	return(ctime(&stbuf.st_mtime));
+  }
+}
+
+/* Output the PNG image to stdout (i.e. the web browser...) */
 void do_image(duc *duc, duc_graph *graph, duc_dir *dir)
 {
 	printf("Content-Type: image/png\n");
@@ -286,7 +317,7 @@ static int cgi_main(int argc, char **argv)
 	};
 
 	int c;
-	while( ( c = getopt_long(argc, argv, "d:D:", longopts, NULL)) != EOF) {
+	while( ( c = getopt_long(argc, argv, "d:D:q", longopts, NULL)) != EOF) {
 
 	    switch(c) {
 	    case 'd':
@@ -299,11 +330,13 @@ static int cgi_main(int argc, char **argv)
 		return -2;
 	    }
 	}
-	
 
 	char *cmd = cgi_get("cmd");
 	char *path = cgi_get("path");
-	if(cmd == NULL) cmd = "index";
+	char *db = cgi_get("db");
+	char *script = getenv("SCRIPT_NAME");
+
+	if(cmd == NULL) { cmd = "index"; }
 	
 	duc *duc = duc_new();
 	if(duc == NULL) {
@@ -313,26 +346,42 @@ static int cgi_main(int argc, char **argv)
         }
 
 	if (db_dir) {
+	  if (db == NULL) {
 	    glob_t bunch_of_dbs;
 	    char **db_file;
+		
+		char url[PATH_MAX];
+		char *db_name;
+
+
 	    size_t n = duc_find_dbs(db_dir, &bunch_of_dbs);
 	    int i = 0;
 
 	    print_html_header("DUC db_dir list");
 	    
-	    printf("<BODY>\n<H1>DUC db_dir list: %s</H1>\n<UL>\n",path);
+	    printf("<BODY>\n<H1>DUC db_dir list: %s</H1>\n<UL>\n",script);
 	    printf("<br>Found %zu (%zu) DBs to look at.<br>\n", n, bunch_of_dbs.gl_pathc);
 	    for (db_file = bunch_of_dbs.gl_pathv; i < n; db_file++, i++) {
-                printf("  <LI> <A HREF= %s\n", *db_file);
+		  db_name = basename(*db_file);
+		  snprintf(url, sizeof url, "%s?db=%s&cmd=index", script, db_name);
+		  printf("  <LI> <A HREF=\"%s\">%s</A> updated %s\n", url, db_name, last_updated(*db_file));
 	    }
 	    printf("</UL>\n</BODY>\n</HTML>\n");
 	    exit(1);
+	  } else {
+		r = duc_open(duc, db, DUC_OPEN_RO);
+		if (r != DUC_OK) {
+		  print_html_header("Error Opening DB");
+		  printf("<BODY>%s\n</BODY></HTML>", duc_strerror(duc));
+		  return -1;
+        }
+	  }
 	}
 
 	path_db = duc_pick_db_path(path_db);
         r = duc_open(duc, path_db, DUC_OPEN_RO);
         if(r != DUC_OK) {
-	    print_html_header("Content-Type: text/plain\n\n");
+	    print_html_header("Error Opening DB");
 	    printf("<BODY>%s\n</BODY></HTML>", duc_strerror(duc));
 		return -1;
         }
@@ -340,7 +389,7 @@ static int cgi_main(int argc, char **argv)
 	duc_dir *dir = NULL;
 
 	if(path) {
-		dir = duc_opendir(duc, path);
+		dir = duc_dir_open(duc, path);
 		if(dir == NULL) {
 			fprintf(stderr, "%s\n", duc_strerror(duc));
 			return 0;
@@ -354,7 +403,7 @@ static int cgi_main(int argc, char **argv)
 	if(strcmp(cmd, "index") == 0) do_index(duc, graph, dir);
 	if(strcmp(cmd, "image") == 0) do_image(duc, graph, dir);
 
-	if(dir) duc_closedir(dir);
+	if(dir) duc_dir_close(dir);
 	duc_close(duc);
 	duc_del(duc);
 
