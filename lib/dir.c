@@ -61,7 +61,7 @@ off_t duc_dir_get_size(duc_dir *dir)
 
 size_t duc_dir_get_count(duc_dir *dir)
 {
-	return dir->file_count + dir->dir_count;
+	return dir->ent_count;
 }
 
 

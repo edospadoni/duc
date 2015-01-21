@@ -3,7 +3,7 @@
 
 #include "duc.h"
 
-#define DUC_DB_VERSION "10"
+#define DUC_DB_VERSION "11"
 
 #ifndef HAVE_LSTAT
 #define lstat stat
@@ -34,8 +34,6 @@ struct duc_dir {
 	char *path;
 	struct duc_dirent *ent_list;
 	off_t size_total;
-	size_t file_count; /* can we remove this? */
-	size_t dir_count; /* can we remove this? */
 	size_t ent_cur;
 	size_t ent_count;
 	size_t ent_pool;

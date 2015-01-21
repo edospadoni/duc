@@ -39,8 +39,6 @@ duc_errno db_write_dir(struct duc_dir *dir)
 	buffer_put_varint(b, dir->dev_parent);
 	buffer_put_varint(b, dir->ino_parent);
 	buffer_put_varint(b, dir->size_total);
-	buffer_put_varint(b, dir->file_count);
-	buffer_put_varint(b, dir->dir_count);
 
 
 	int i;
@@ -97,8 +95,6 @@ struct duc_dir *db_read_dir(struct duc *duc, dev_t dev, ino_t ino)
 	buffer_get_varint(b, &v); dir->dev_parent = v;
 	buffer_get_varint(b, &v); dir->ino_parent = v;
 	buffer_get_varint(b, &v); dir->size_total = v;
-	buffer_get_varint(b, &v); dir->file_count = v;
-	buffer_get_varint(b, &v); dir->dir_count = v;
 	
 	while(b->ptr < b->len) {
 

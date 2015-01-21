@@ -127,7 +127,7 @@ struct job {
 };
 
 
-struct job *job_new(const char *path)
+static struct job *job_new(const char *path)
 {
 	struct job *j;
 	
@@ -141,19 +141,19 @@ struct job *job_new(const char *path)
 }
 
 
-void job_lock(struct job *j)
+static void job_lock(struct job *j)
 {
 	pthread_mutex_lock(&j->mutex);
 }
 
 
-void job_unlock(struct job *j)
+static void job_unlock(struct job *j)
 {
 	pthread_mutex_unlock(&j->mutex);
 }
 
 
-void job_free(struct job *j)
+static void job_free(struct job *j)
 {
 	duc_free(j->path);
 
@@ -170,7 +170,7 @@ void job_free(struct job *j)
 }
 
 
-int check_complete(struct job *j)
+static int check_job_complete(struct job *j)
 {
 	if(j->subjobs == 0) {
 		
@@ -193,7 +193,7 @@ int check_complete(struct job *j)
 }
 
 
-void on_done(struct job *j, void *ptr)
+static void on_job_done(struct job *j, void *ptr)
 {
 	struct job *j_parent = ptr;
 	assert(j_parent);
@@ -213,11 +213,11 @@ void on_done(struct job *j, void *ptr)
 
 	j_parent->subjobs --;
 
-	check_complete(j_parent);
+	check_job_complete(j_parent);
 }
 
 
-void *do_job(void *p)
+static void *do_job(void *p)
 {
 	struct job *j = p;
 
@@ -234,7 +234,7 @@ void *do_job(void *p)
 	j->fd_dir = openat(fd_parent, path, O_RDONLY | O_NOCTTY | O_DIRECTORY | O_NOFOLLOW);
 	if(j->fd_dir == -1) {
 		duc_log(duc, DUC_LOG_WRN, "Skipping %s: %s\n", path, strerror(errno));
-		check_complete(j);
+		check_job_complete(j);
 		return NULL;
 	}
 
@@ -242,7 +242,7 @@ void *do_job(void *p)
 	int r = fstat(j->fd_dir, &st_dir);
 	if(r == -1) {
 		duc_log(duc, DUC_LOG_WRN, "fstat(%s): %s\n", path, strerror(errno));
-		check_complete(j);
+		check_job_complete(j);
 		return NULL;
 	}
 
@@ -252,7 +252,7 @@ void *do_job(void *p)
 	j->d = fdopendir(j->fd_dir);
 	if(j->d == NULL) {
 		duc_log(duc, DUC_LOG_WRN, "fdopendir(%s): %s\n", path, strerror(errno));
-		check_complete(j);
+		check_job_complete(j);
 		return NULL;
 	}
 
@@ -304,7 +304,7 @@ void *do_job(void *p)
 			j2->pool = j->pool;
 			j2->fd_parent = j->fd_dir;
 			j2->depth = depth + 1;
-			j2->fn_done = on_done;
+			j2->fn_done = on_job_done;
 			j2->ptr = j;
 
 			if(req->maxdepth == 0 || j->depth < req->maxdepth) {
@@ -318,7 +318,6 @@ void *do_job(void *p)
 			thr_pool_queue(j2->pool, do_job, j2);
 
 			if(j->dir) {
-				j->dir->dir_count ++;
 				j->dir_count ++;
 			}
 
@@ -333,7 +332,6 @@ void *do_job(void *p)
 			}
 
 			if(j->dir) {
-				j->dir->file_count ++;
 				j->dir->size_total += st.st_size;
 				duc_dir_add_ent(j->dir, name, st.st_size, e.d_type, st.st_dev, st.st_ino);
 			}
@@ -341,13 +339,13 @@ void *do_job(void *p)
 		}
 	}
 	
-	check_complete(j);
+	check_job_complete(j);
 
 	return NULL;
-}	
+}
 
 
-void all_done(struct job *j, void *ptr)
+static void index_done(struct job *j, void *ptr)
 {
 	struct duc_index_report *report = ptr;
 
@@ -400,7 +398,7 @@ struct duc_index_report *duc_index(duc_index_req *req, const char *path, duc_ind
 	struct job *j = job_new(path_canon);
 	j->req = req;
 	j->pool = pool;
-	j->fn_done = all_done;
+	j->fn_done = index_done;
 	j->ptr = report;
 	j->dir = duc_dir_new(duc, st.st_dev, st.st_ino);
 
