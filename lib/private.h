@@ -34,8 +34,8 @@ struct duc_dir {
 	char *path;
 	struct duc_dirent *ent_list;
 	off_t size_total;
-	size_t file_count;
-	size_t dir_count;
+	size_t file_count; /* can we remove this? */
+	size_t dir_count; /* can we remove this? */
 	size_t ent_cur;
 	size_t ent_count;
 	size_t ent_pool;
@@ -44,6 +44,7 @@ struct duc_dir {
 void *duc_malloc(size_t s);
 void *duc_realloc(void *p, size_t s);
 char *duc_strdup(const char *s);
+void duc_free(void *p);
 
 void duc_log(struct duc *duc, duc_log_level lvl, const char *fmt, ...);
 

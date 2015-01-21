@@ -19,11 +19,13 @@
 #ifdef HAVE_FNMATCH_H
 #include <fnmatch.h>
 #endif
+#include <pthread.h>
 
 #include "db.h"
 #include "duc.h"
 #include "list.h"
 #include "private.h"
+#include "threadpool.h"
 
 struct duc_index_req {
 	duc *duc;
@@ -101,128 +103,261 @@ static int match_list(const char *name, struct list *l)
 }
 
 
+struct job {
+	pthread_mutex_t mutex;
+	struct duc_index_req *req;
+	int depth;
+	thr_pool_t *pool;
+	int fd_parent;
+	char *path;
+	void (*fn_done)(struct job *j, void *ptr);
+	void *ptr;
 
-static off_t index_dir(struct duc_index_req *req, struct duc_index_report *report, const char *path, int fd_parent, struct stat *st_parent, int depth)
+	/* worker data */
+
+	struct duc_dir *dir;
+	int subjobs;
+	int fd_dir;
+	DIR *d;
+	off_t file_count;
+	off_t dir_count;
+	off_t size_total;
+	dev_t dev;
+	ino_t ino;
+};
+
+
+struct job *job_new(const char *path)
 {
-	struct duc *duc = req->duc;
-	off_t size_dir = 0;
-
-
-	/* Open dir and read file status */
-
-	int fd_dir = openat(fd_parent, path, O_RDONLY | O_NOCTTY | O_DIRECTORY | O_NOFOLLOW);
-	if(fd_dir == -1) {
-		duc_log(duc, DUC_LOG_WRN, "Skipping %s: %s\n", path, strerror(errno));
-		return 0;
-	}
-
-	struct stat st_dir;
-	int r = fstat(fd_dir, &st_dir);
-	if(r == -1) {
-		duc_log(duc, DUC_LOG_WRN, "Error statting %s: %s\n", path, strerror(errno));
-		close(fd_dir);
-		return 0;
-	}
+	struct job *j;
 	
-	if(req->dev == 0) {
-		req->dev = st_dir.st_dev;
-	}
+	j = duc_malloc(sizeof *j);
+	memset(j, 0, sizeof(*j));
 
-	if(report->dev == 0) {
-		report->dev = st_dir.st_dev;
-		report->ino = st_dir.st_ino;
-	}
+	pthread_mutex_init(&j->mutex, NULL);
+	j->path = duc_strdup(path);
+	
+	return j;
+}
 
 
-	/* Check if we are allowed to cross file system boundaries */
+void job_lock(struct job *j)
+{
+	pthread_mutex_lock(&j->mutex);
+}
 
-	if(req->flags & DUC_INDEX_XDEV) {
-		if(st_dir.st_dev != req->dev) {
-			duc_log(duc, DUC_LOG_WRN, "Skipping %s: not crossing file system boundaries\n", path);
-			return 0;
+
+void job_unlock(struct job *j)
+{
+	pthread_mutex_unlock(&j->mutex);
+}
+
+
+void job_free(struct job *j)
+{
+	duc_free(j->path);
+
+	if(j->d > 0) {
+		closedir(j->d);
+	} else {
+		if(j->fd_dir) {
+			close(j->fd_dir);
 		}
 	}
 
-	DIR *d = fdopendir(fd_dir);
-	if(d == NULL) {
-		duc_log(duc, DUC_LOG_WRN, "Skipping %s: %s\n", path, strerror(errno));
-		close(fd_dir);
+	job_unlock(j);
+	duc_free(j);
+}
+
+
+int check_complete(struct job *j)
+{
+	if(j->subjobs == 0) {
+		
+		if(j->fn_done) {
+			j->fn_done(j, j->ptr);
+		}
+
+		if(j->dir) {
+			db_write_dir(j->dir);
+			duc_dir_close(j->dir);
+		}
+
+		job_free(j);
+
+		return 1;
+	} else {
+		job_unlock(j);
 		return 0;
 	}
+}
 
-	struct duc_dir *dir = duc_dir_new(duc, st_dir.st_dev, st_dir.st_ino);
 
-	if(st_parent) {
-		dir->dev_parent = st_parent->st_dev;
-		dir->ino_parent = st_parent->st_ino;
+void on_done(struct job *j, void *ptr)
+{
+	struct job *j_parent = ptr;
+	assert(j_parent);
+
+	job_lock(j_parent);
+
+	if(j_parent->dir) {
+		if(j->dir) {
+			duc_dir_add_ent(j_parent->dir, j->path, j->size_total, DT_DIR, j->dev, j->ino);
+		}
+		j_parent->dir->size_total += j->size_total;
 	}
 
+	j_parent->file_count += j->file_count;
+	j_parent->dir_count += j->dir_count;
+	j_parent->size_total += j->size_total;
+
+	j_parent->subjobs --;
+
+	check_complete(j_parent);
+}
+
+
+void *do_job(void *p)
+{
+	struct job *j = p;
+
+	job_lock(j);
+
+	struct duc_index_req *req = j->req;
+	struct duc *duc = req->duc;
+	const char *path = j->path;
+	int fd_parent = j->fd_parent;
+	int depth = j->depth;
+
+	/* Open dir and read file status */
+
+	j->fd_dir = openat(fd_parent, path, O_RDONLY | O_NOCTTY | O_DIRECTORY | O_NOFOLLOW);
+	if(j->fd_dir == -1) {
+		duc_log(duc, DUC_LOG_WRN, "Skipping %s: %s\n", path, strerror(errno));
+		check_complete(j);
+		return NULL;
+	}
+
+	struct stat st_dir;
+	int r = fstat(j->fd_dir, &st_dir);
+	if(r == -1) {
+		duc_log(duc, DUC_LOG_WRN, "fstat(%s): %s\n", path, strerror(errno));
+		check_complete(j);
+		return NULL;
+	}
+
+	j->dev = st_dir.st_dev;
+	j->ino = st_dir.st_ino;
+	
+	j->d = fdopendir(j->fd_dir);
+	if(j->d == NULL) {
+		duc_log(duc, DUC_LOG_WRN, "fdopendir(%s): %s\n", path, strerror(errno));
+		check_complete(j);
+		return NULL;
+	}
 
 	/* Iterate directory entries */
 
-	struct dirent *e;
-	while( (e = readdir(d)) != NULL) {
+	struct dirent e;
+	struct dirent *e_result;
+
+	while( readdir_r(j->d, &e, &e_result) == 0) {
+
+		if(e_result == NULL) break;
 
 		/* Skip . and .. */
 
-		const char *n = e->d_name;
+		const char *n = e.d_name;
 		if(n[0] == '.') {
 			if(n[1] == '\0') continue;
 			if(n[1] == '.' && n[2] == '\0') continue;
 		}
 
-		if(match_list(e->d_name, req->exclude_list)) continue;
+		if(match_list(e.d_name, req->exclude_list)) continue;
 
 		/* Get file info */
 
 		struct stat st;
-		int r = fstatat(fd_dir, e->d_name, &st, AT_SYMLINK_NOFOLLOW);
+		int r = fstatat(j->fd_dir, e.d_name, &st, AT_SYMLINK_NOFOLLOW);
 		if(r == -1) {
-			duc_log(duc, DUC_LOG_WRN, "Error statting %s: %s\n", e->d_name, strerror(errno));
+			duc_log(duc, DUC_LOG_WRN, "Error statting %s: %s\n", e.d_name, strerror(errno));
 			continue;
 		}
 
-		/* Calculate size, recursing when needed */
+		duc_log(duc, DUC_LOG_DMP, "%s\n", e.d_name);
 
-		off_t size = 0;
-		
-		if(S_ISDIR(st.st_mode)) {
-			size += index_dir(req, report, e->d_name, fd_dir, &st_dir, depth+1);
-			dir->dir_count ++;
-			report->dir_count ++;
+		if(e.d_type == DT_DIR) {
+
+			/* Check if we are allowed to cross file system boundaries */
+
+			if(req->flags & DUC_INDEX_XDEV) {
+				if(st.st_dev != req->dev) {
+					duc_log(duc, DUC_LOG_WRN, "Skipping %s: not crossing file system boundaries\n", path);
+					continue;
+				}
+			}
+
+			/* Create new job for indexing subdirectory */
+
+			struct job *j2 = job_new(e.d_name);
+			j2->req = j->req;
+			j2->pool = j->pool;
+			j2->fd_parent = j->fd_dir;
+			j2->depth = depth + 1;
+			j2->fn_done = on_done;
+			j2->ptr = j;
+
+			if(req->maxdepth == 0 || j->depth < req->maxdepth) {
+				j2->dir = duc_dir_new(duc, st.st_dev, st.st_ino);
+				j2->dir->dev_parent = st_dir.st_dev;
+				j2->dir->ino_parent = st_dir.st_ino;
+			}
+
+			j->subjobs ++;
+
+			thr_pool_queue(j2->pool, do_job, j2);
+
+			if(j->dir) {
+				j->dir->dir_count ++;
+				j->dir_count ++;
+			}
+
 		} else {
-			size = st.st_size;
-			dir->file_count ++;
-			report->file_count ++;
-		}
 
-		duc_log(duc, DUC_LOG_DMP, "%s %jd\n", e->d_name, size);
+			j->file_count ++;
+			j->size_total += st.st_size;
 
-		/* Store record */
-
-		if(req->maxdepth == 0 || depth < req->maxdepth) {
-
-			char *name = e->d_name;
-		
-			/* Hide file names? */
-
+			char *name = e.d_name;
 			if((req->flags & DUC_INDEX_HIDE_FILE_NAMES) && !S_ISDIR(st.st_mode)) {
 				name = "<FILE>";
 			}
 
-			duc_dir_add_ent(dir, name, size, e->d_type, st.st_dev, st.st_ino);
-		}
-		dir->size_total += size;
-		size_dir += size;
-	}
+			if(j->dir) {
+				j->dir->file_count ++;
+				j->dir->size_total += st.st_size;
+				duc_dir_add_ent(j->dir, name, st.st_size, e.d_type, st.st_dev, st.st_ino);
+			}
 		
-	db_write_dir(dir);
-	duc_dir_close(dir);
+		}
+	}
+	
+	check_complete(j);
 
-	closedir(d);
-
-	return size_dir;
+	return NULL;
 }	
+
+
+void all_done(struct job *j, void *ptr)
+{
+	struct duc_index_report *report = ptr;
+
+	printf("all done %ld\n", j->dir->size_total);
+
+	report->file_count = j->file_count;
+	report->dir_count = j->dir_count;
+	report->size_total = j->size_total;
+
+}
 
 
 struct duc_index_report *duc_index(duc_index_req *req, const char *path, duc_index_flags flags)
@@ -246,19 +381,34 @@ struct duc_index_report *duc_index(duc_index_req *req, const char *path, duc_ind
 	
 	struct duc_index_report *report = duc_malloc(sizeof(struct duc_index_report));
 	memset(report, 0, sizeof *report);
+	snprintf(report->path, sizeof(report->path), "%s", path_canon);
+
+	/* Get dev ID and inode of starting path */
+
+	struct stat st;
+	lstat(path_canon, &st);
+	req->dev = st.st_dev;
+	report->dev = st.st_dev;
+	report->ino = st.st_ino;
 
 	/* Recursively index subdirectories */
 
 	gettimeofday(&report->time_start, NULL);
-	report->size_total = index_dir(req, report, path_canon, 0, NULL, 0);
+	
+	thr_pool_t *pool = thr_pool_create(4, 4, 1, NULL);
+
+	struct job *j = job_new(path_canon);
+	j->req = req;
+	j->pool = pool;
+	j->fn_done = all_done;
+	j->ptr = report;
+	j->dir = duc_dir_new(duc, st.st_dev, st.st_ino);
+
+	thr_pool_queue(pool, do_job, j);
+	thr_pool_wait(pool);
+
 	gettimeofday(&report->time_stop, NULL);
 	
-	/* Fill in report */
-
-	snprintf(report->path, sizeof(report->path), "%s", path_canon);
-	//report->dev = st.st_dev;
-	//report->ino = st.st_ino;
-
 	/* Store report */
 
 	db_write_report(duc, report);

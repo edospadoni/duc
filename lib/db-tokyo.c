@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h> 
+#include <pthread.h> 
 
 #include "duc.h"
 #include "private.h"
@@ -16,6 +17,7 @@
 
 struct db {
 	TCBDB* hdb;
+	pthread_mutex_t mutex;
 };
 
 struct db *db_open(const char *path_db, int flags, duc_errno *e)
@@ -23,7 +25,7 @@ struct db *db_open(const char *path_db, int flags, duc_errno *e)
 	struct db *db;
 	int compress = 0;
 
-	uint32_t mode = HDBONOLCK | HDBOREADER;
+	uint32_t mode = HDBOREADER;
 	if(flags & DUC_OPEN_RW) mode |= HDBOWRITER | HDBOCREAT;
 	if(flags & DUC_OPEN_COMPRESS) compress = 1;
 
@@ -31,6 +33,8 @@ struct db *db_open(const char *path_db, int flags, duc_errno *e)
 	if(flags & DUC_OPEN_FORCE) { mode |= BDBOTRUNC; }
 
 	db = duc_malloc(sizeof *db);
+
+	pthread_mutex_init(&db->mutex, NULL);
 
 	db->hdb = tcbdbnew();
 	if(!db->hdb) {
@@ -74,15 +78,19 @@ err1:
 
 void db_close(struct db *db)
 {
+	pthread_mutex_lock(&db->mutex);
 	tcbdbclose(db->hdb);
 	tcbdbdel(db->hdb);
+	pthread_mutex_unlock(&db->mutex);
 	free(db);
 }
 
 
 duc_errno db_put(struct db *db, const void *key, size_t key_len, const void *val, size_t val_len)
 {
+	pthread_mutex_lock(&db->mutex);
 	int r = tcbdbput(db->hdb, key, key_len, val, val_len);
+	pthread_mutex_unlock(&db->mutex);
 	return (r==1) ? DUC_OK : DUC_E_UNKNOWN;
 }
 
@@ -90,7 +98,9 @@ duc_errno db_put(struct db *db, const void *key, size_t key_len, const void *val
 void *db_get(struct db *db, const void *key, size_t key_len, size_t *val_len)
 {
 	int vall;
+	pthread_mutex_lock(&db->mutex);
 	void *val = tcbdbget(db->hdb, key, key_len, &vall);
+	pthread_mutex_unlock(&db->mutex);
 	*val_len = vall;
 	return val;
 }

@@ -242,6 +242,11 @@ char *duc_strdup(const char *s)
 }
 
 
+void duc_free(void *p)
+{
+	free(p);
+}
+
 
 /*
  * End
